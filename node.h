@@ -24,9 +24,9 @@
 
 #ifdef _WIN32
 # ifndef BUILDING_NODE_EXTENSION
-#   define NODE_EXTERN __declspec(dllexport)
+#  define NODE_EXTERN __declspec(dllexport)
 # else
-#   define NODE_EXTERN __declspec(dllimport)
+#  define NODE_EXTERN __declspec(dllimport)
 # endif
 #else
 # define NODE_EXTERN __attribute__((visibility("default")))
@@ -43,7 +43,7 @@
 // See issue https://github.com/nodejs/node-v0.x-archive/issues/1236
 #if defined(__MINGW32__) || defined(_MSC_VER)
 #ifndef _WIN32_WINNT
-# define _WIN32_WINNT   0x0600  // Windows Server 2008
+# define _WIN32_WINNT 0x0600  // Windows Server 2008
 #endif
 
 #ifndef NOMINMAX
@@ -57,14 +57,23 @@
 #endif
 
 #ifdef _WIN32
-# define SIGKILL         9
+# define SIGKILL 9
 #endif
 
+#if (__GNUC__ >= 8) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+#endif
 #include "v8.h"  // NOLINT(build/include_order)
+#if (__GNUC__ >= 8) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 #include "v8-platform.h"  // NOLINT(build/include_order)
 #include "node_version.h"  // NODE_MODULE_VERSION
 
 #include <memory>
+#include <functional>
 
 #define NODE_MAKE_VERSION(major, minor, patch)                                \
   ((major) * 0x1000 + (minor) * 0x100 + (patch))
@@ -184,8 +193,8 @@ NODE_DEPRECATED("Use MakeCallback(..., async_context)",
 #include <cstdint>
 
 #ifndef NODE_STRINGIFY
-#define NODE_STRINGIFY(n) NODE_STRINGIFY_HELPER(n)
-#define NODE_STRINGIFY_HELPER(n) #n
+# define NODE_STRINGIFY(n) NODE_STRINGIFY_HELPER(n)
+# define NODE_STRINGIFY_HELPER(n) #n
 #endif
 
 #ifdef _WIN32
@@ -209,15 +218,36 @@ class Environment;
 NODE_EXTERN int Start(int argc, char* argv[]);
 
 // Tear down Node.js while it is running (there are active handles
-// in the loop and / or actively executing JavaScript code).
+// in the loop and / or actively executing JavaScript code). This also stops
+// all Workers that may have been started earlier.
 NODE_EXTERN int Stop(Environment* env);
 
 // TODO(addaleax): Officially deprecate this and replace it with something
 // better suited for a public embedder API.
+// It is recommended to use InitializeNodeWithArgs() instead as an embedder.
+// Init() calls InitializeNodeWithArgs() and exits the process with the exit
+// code returned from it.
 NODE_EXTERN void Init(int* argc,
                       const char** argv,
                       int* exec_argc,
                       const char*** exec_argv);
+// Set up per-process state needed to run Node.js. This will consume arguments
+// from argv, fill exec_argv, and possibly add errors resulting from parsing
+// the arguments to `errors`. The return value is a suggested exit code for the
+// program; If it is 0, then initializing Node.js succeeded.
+NODE_EXTERN int InitializeNodeWithArgs(std::vector<std::string>* argv,
+                                       std::vector<std::string>* exec_argv,
+                                       std::vector<std::string>* errors);
+
+enum OptionEnvvarSettings {
+  kAllowedInEnvironment,
+  kDisallowedInEnvironment
+};
+
+NODE_EXTERN int ProcessGlobalArgs(std::vector<std::string>* args,
+                      std::vector<std::string>* exec_args,
+                      std::vector<std::string>* errors,
+                      OptionEnvvarSettings settings);
 
 class NodeArrayBufferAllocator;
 
@@ -248,13 +278,17 @@ NODE_EXTERN void FreeArrayBufferAllocator(ArrayBufferAllocator* allocator);
 
 class NODE_EXTERN MultiIsolatePlatform : public v8::Platform {
  public:
-  ~MultiIsolatePlatform() override { }
+  ~MultiIsolatePlatform() override = default;
   // Returns true if work was dispatched or executed. New tasks that are
   // posted during flushing of the queue are postponed until the next
   // flushing.
   virtual bool FlushForegroundTasks(v8::Isolate* isolate) = 0;
   virtual void DrainTasks(v8::Isolate* isolate) = 0;
-  virtual void CancelPendingDelayedTasks(v8::Isolate* isolate) = 0;
+
+  // TODO(addaleax): Remove this, it is unnecessary.
+  // This would currently be called before `UnregisterIsolate()` but will be
+  // folded into it in the future.
+  virtual void CancelPendingDelayedTasks(v8::Isolate* isolate);
 
   // This needs to be called between the calls to `Isolate::Allocate()` and
   // `Isolate::Initialize()`, so that initialization can already start
@@ -263,26 +297,58 @@ class NODE_EXTERN MultiIsolatePlatform : public v8::Platform {
   // This function may only be called once per `Isolate`.
   virtual void RegisterIsolate(v8::Isolate* isolate,
                                struct uv_loop_s* loop) = 0;
+
+  // This function may only be called once per `Isolate`, and discard any
+  // pending delayed tasks scheduled for that isolate.
   // This needs to be called right before calling `Isolate::Dispose()`.
-  // This function may only be called once per `Isolate`.
   virtual void UnregisterIsolate(v8::Isolate* isolate) = 0;
+
   // The platform should call the passed function once all state associated
   // with the given isolate has been cleaned up. This can, but does not have to,
   // happen asynchronously.
   virtual void AddIsolateFinishedCallback(v8::Isolate* isolate,
                                           void (*callback)(void*),
                                           void* data) = 0;
+
+  static std::unique_ptr<MultiIsolatePlatform> Create(
+      int thread_pool_size,
+      v8::TracingController* tracing_controller = nullptr);
 };
 
-// Set up some Node.js-specific defaults for `params`, in particular
-// the ArrayBuffer::Allocator if it is provided, memory limits, and
-// possibly a code event handler.
-NODE_EXTERN void SetIsolateCreateParams(v8::Isolate::CreateParams* params,
-                                        ArrayBufferAllocator* allocator
-                                            = nullptr);
+enum IsolateSettingsFlags {
+  MESSAGE_LISTENER_WITH_ERROR_LEVEL = 1 << 0,
+  DETAILED_SOURCE_POSITIONS_FOR_PROFILING = 1 << 1,
+  SHOULD_NOT_SET_PROMISE_REJECTION_CALLBACK = 1 << 2
+};
+
+struct IsolateSettings {
+  uint64_t flags = MESSAGE_LISTENER_WITH_ERROR_LEVEL |
+      DETAILED_SOURCE_POSITIONS_FOR_PROFILING;
+  v8::MicrotasksPolicy policy = v8::MicrotasksPolicy::kExplicit;
+
+  // Error handling callbacks
+  v8::Isolate::AbortOnUncaughtExceptionCallback
+      should_abort_on_uncaught_exception_callback = nullptr;
+  v8::FatalErrorCallback fatal_error_callback = nullptr;
+  v8::PrepareStackTraceCallback prepare_stack_trace_callback = nullptr;
+
+  // Miscellaneous callbacks
+  v8::PromiseRejectCallback promise_reject_callback = nullptr;
+  v8::AllowWasmCodeGenerationCallback
+      allow_wasm_code_generation_callback = nullptr;
+  v8::HostCleanupFinalizationGroupCallback
+      host_cleanup_finalization_group_callback = nullptr;
+};
+
+// Overriding IsolateSettings may produce unexpected behavior
+// in Node.js core functionality, so proceed at your own risk.
+NODE_EXTERN void SetIsolateUpForNode(v8::Isolate* isolate,
+                                     const IsolateSettings& settings);
+
 // Set a number of callbacks for the `isolate`, in particular the Node.js
 // uncaught exception listener.
 NODE_EXTERN void SetIsolateUpForNode(v8::Isolate* isolate);
+
 // Creates a new isolate with Node.js-specific settings.
 // This is a convenience method equivalent to using SetIsolateCreateParams(),
 // Isolate::Allocate(), MultiIsolatePlatform::RegisterIsolate(),
@@ -299,6 +365,10 @@ NODE_EXTERN v8::Local<v8::Context> NewContext(
     v8::Local<v8::ObjectTemplate> object_template =
         v8::Local<v8::ObjectTemplate>());
 
+// Runs Node.js-specific tweaks on an already constructed context
+// Return value indicates success of operation
+NODE_EXTERN bool InitializeContext(v8::Local<v8::Context> context);
+
 // If `platform` is passed, it will be used to register new Worker instances.
 // It can be `nullptr`, in which case creating new Workers inside of
 // Environments that use this `IsolateData` will not work.
@@ -309,33 +379,144 @@ NODE_EXTERN IsolateData* CreateIsolateData(
     ArrayBufferAllocator* allocator = nullptr);
 NODE_EXTERN void FreeIsolateData(IsolateData* isolate_data);
 
-// TODO(addaleax): Add an official variant using STL containers, and move
-// per-Environment options parsing here.
+struct ThreadId {
+  uint64_t id = static_cast<uint64_t>(-1);
+};
+NODE_EXTERN ThreadId AllocateEnvironmentThreadId();
+
+namespace EnvironmentFlags {
+enum Flags : uint64_t {
+  kNoFlags = 0,
+  // Use the default behaviour for Node.js instances.
+  kDefaultFlags = 1 << 0,
+  // Controls whether this Environment is allowed to affect per-process state
+  // (e.g. cwd, process title, uid, etc.).
+  // This is set when using kDefaultFlags.
+  kOwnsProcessState = 1 << 1,
+  // Set if this Environment instance is associated with the global inspector
+  // handling code (i.e. listening on SIGUSR1).
+  // This is set when using kDefaultFlags.
+  kOwnsInspector = 1 << 2,
+  // Set if Node.js should not run its own esm loader. This is needed by some
+  // embedders, because it's possible for the Node.js esm loader to conflict
+  // with another one in an embedder environment, e.g. Blink's in Chromium.
+  kNoRegisterESMLoader = 1 << 3,
+  // Set this flag to make Node.js track "raw" file descriptors, i.e. managed
+  // by fs.open() and fs.close(), and close them during FreeEnvironment().
+  kTrackUnmanagedFds = 1 << 4
+};
+}  // namespace EnvironmentFlags
+
+struct InspectorParentHandle {
+  virtual ~InspectorParentHandle();
+};
+
+// TODO(addaleax): Maybe move per-Environment options parsing here.
 // Returns nullptr when the Environment cannot be created e.g. there are
 // pending JavaScript exceptions.
+// It is recommended to use the second variant taking a flags argument.
 NODE_EXTERN Environment* CreateEnvironment(IsolateData* isolate_data,
                                            v8::Local<v8::Context> context,
                                            int argc,
                                            const char* const* argv,
                                            int exec_argc,
                                            const char* const* exec_argv);
+NODE_EXTERN Environment* CreateEnvironment(
+    IsolateData* isolate_data,
+    v8::Local<v8::Context> context,
+    const std::vector<std::string>& args,
+    const std::vector<std::string>& exec_args,
+    EnvironmentFlags::Flags flags = EnvironmentFlags::kDefaultFlags,
+    ThreadId thread_id = {} /* allocates a thread id automatically */,
+    std::unique_ptr<InspectorParentHandle> inspector_parent_handle = {});
 
+// Returns a handle that can be passed to `LoadEnvironment()`, making the
+// child Environment accessible to the inspector as if it were a Node.js Worker.
+// `child_thread_id` can be created using `AllocateEnvironmentThreadId()`
+// and then later passed on to `CreateEnvironment()` to create the child
+// Environment, together with the inspector handle.
+// This method should not be called while the parent Environment is active
+// on another thread.
+NODE_EXTERN std::unique_ptr<InspectorParentHandle> GetInspectorParentHandle(
+    Environment* parent_env,
+    ThreadId child_thread_id,
+    const char* child_url);
+
+struct StartExecutionCallbackInfo {
+  v8::Local<v8::Object> process_object;
+  v8::Local<v8::Function> native_require;
+};
+
+using StartExecutionCallback =
+    std::function<v8::MaybeLocal<v8::Value>(const StartExecutionCallbackInfo&)>;
+
+// TODO(addaleax): Deprecate this in favour of the MaybeLocal<> overload.
 NODE_EXTERN void LoadEnvironment(Environment* env);
+// The `InspectorParentHandle` arguments here are ignored and not used.
+// For passing `InspectorParentHandle`, use `CreateEnvironment()`.
+NODE_EXTERN v8::MaybeLocal<v8::Value> LoadEnvironment(
+    Environment* env,
+    StartExecutionCallback cb,
+    std::unique_ptr<InspectorParentHandle> ignored_donotuse_removeme = {});
+NODE_EXTERN v8::MaybeLocal<v8::Value> LoadEnvironment(
+    Environment* env,
+    const char* main_script_source_utf8,
+    std::unique_ptr<InspectorParentHandle> ignored_donotuse_removeme = {});
 NODE_EXTERN void FreeEnvironment(Environment* env);
+
+// Set a callback that is called when process.exit() is called from JS,
+// overriding the default handler.
+// It receives the Environment* instance and the exit code as arguments.
+// This could e.g. call Stop(env); in order to terminate execution and stop
+// the event loop.
+// The default handler calls Stop(), disposes of the global V8 platform
+// instance, if one is being used, and calls exit().
+NODE_EXTERN void SetProcessExitHandler(
+    Environment* env,
+    std::function<void(Environment*, int)>&& handler);
+NODE_EXTERN void DefaultProcessExitHandler(Environment* env, int exit_code);
 
 // This may return nullptr if context is not associated with a Node instance.
 NODE_EXTERN Environment* GetCurrentEnvironment(v8::Local<v8::Context> context);
 
-// This returns the MultiIsolatePlatform used in the main thread of Node.js.
-// If NODE_USE_V8_PLATFORM haven't been defined when Node.js was built,
-// it returns nullptr.
-NODE_EXTERN MultiIsolatePlatform* GetMainThreadMultiIsolatePlatform();
+NODE_EXTERN void OnFatalError(const char* location, const char* message);
+NODE_EXTERN void PromiseRejectCallback(v8::PromiseRejectMessage message);
+NODE_EXTERN bool AllowWasmCodeGenerationCallback(v8::Local<v8::Context> context,
+                                            v8::Local<v8::String>);
+NODE_EXTERN bool ShouldAbortOnUncaughtException(v8::Isolate* isolate);
+NODE_EXTERN v8::MaybeLocal<v8::Value> PrepareStackTraceCallback(
+    v8::Local<v8::Context> context,
+    v8::Local<v8::Value> exception,
+    v8::Local<v8::Array> trace);
 
+// This returns the MultiIsolatePlatform used in the main thread of Node.js.
+// If NODE_USE_V8_PLATFORM has not been defined when Node.js was built,
+// it returns nullptr.
+// TODO(addaleax): Deprecate in favour of GetMultiIsolatePlatform().
+NODE_EXTERN MultiIsolatePlatform* GetMainThreadMultiIsolatePlatform();
+// This returns the MultiIsolatePlatform used for an Environment or IsolateData
+// instance, if one exists.
+NODE_EXTERN MultiIsolatePlatform* GetMultiIsolatePlatform(Environment* env);
+NODE_EXTERN MultiIsolatePlatform* GetMultiIsolatePlatform(IsolateData* env);
+
+// Legacy variants of MultiIsolatePlatform::Create().
+// TODO(addaleax): Deprecate in favour of the v8::TracingController variant.
 NODE_EXTERN MultiIsolatePlatform* CreatePlatform(
     int thread_pool_size,
     node::tracing::TracingController* tracing_controller);
-MultiIsolatePlatform* InitializeV8Platform(int thread_pool_size);
+NODE_EXTERN MultiIsolatePlatform* CreatePlatform(
+    int thread_pool_size,
+    v8::TracingController* tracing_controller);
 NODE_EXTERN void FreePlatform(MultiIsolatePlatform* platform);
+
+// Get/set the currently active tracing controller. Using CreatePlatform()
+// will implicitly set this by default. This is global and should be initialized
+// along with the v8::Platform instance that is being used. `controller`
+// is allowed to be `nullptr`.
+// This is used for tracing events from Node.js itself. V8 uses the tracing
+// controller returned from the active `v8::Platform` instance.
+NODE_EXTERN v8::TracingController* GetTracingController();
+NODE_EXTERN void SetTracingController(v8::TracingController* controller);
 
 NODE_EXTERN void EmitBeforeExit(Environment* env);
 NODE_EXTERN int EmitExit(Environment* env);
@@ -628,10 +809,26 @@ extern "C" NODE_EXTERN void node_module_register(void* mod);
                                v8::Local<v8::Value> module,           \
                                v8::Local<v8::Context> context)
 
+// Allows embedders to add a binding to the current Environment* that can be
+// accessed through process._linkedBinding() in the target Environment and all
+// Worker threads that it creates.
+// In each variant, the registration function needs to be usable at least for
+// the time during which the Environment exists.
+NODE_EXTERN void AddLinkedBinding(Environment* env, const node_module& mod);
+NODE_EXTERN void AddLinkedBinding(Environment* env,
+                                  const char* name,
+                                  addon_context_register_func fn,
+                                  void* priv);
+
 /* Called after the event loop exits but before the VM is disposed.
  * Callbacks are run in reverse order of registration, i.e. newest first.
+ *
+ * You should always use the three-argument variant (or, for addons,
+ * AddEnvironmentCleanupHook) in order to avoid relying on global state.
  */
-NODE_EXTERN void AtExit(void (*cb)(void* arg), void* arg = nullptr);
+NODE_DEPRECATED(
+    "Use the three-argument variant of AtExit() or AddEnvironmentCleanupHook()",
+    NODE_EXTERN void AtExit(void (*cb)(void* arg), void* arg = nullptr));
 
 /* Registers a callback with the passed-in Environment instance. The callback
  * is called after the event loop exits, but before the VM is disposed.
@@ -639,7 +836,13 @@ NODE_EXTERN void AtExit(void (*cb)(void* arg), void* arg = nullptr);
  */
 NODE_EXTERN void AtExit(Environment* env,
                         void (*cb)(void* arg),
-                        void* arg = nullptr);
+                        void* arg);
+NODE_DEPRECATED(
+    "Use the three-argument variant of AtExit() or AddEnvironmentCleanupHook()",
+    inline void AtExit(Environment* env,
+                       void (*cb)(void* arg)) {
+      AtExit(env, cb, nullptr);
+    })
 
 typedef double async_id;
 struct async_context {
@@ -659,6 +862,20 @@ NODE_EXTERN void AddEnvironmentCleanupHook(v8::Isolate* isolate,
 NODE_EXTERN void RemoveEnvironmentCleanupHook(v8::Isolate* isolate,
                                               void (*fun)(void* arg),
                                               void* arg);
+
+/* These are async equivalents of the above. After the cleanup hook is invoked,
+ * `cb(cbarg)` *must* be called, and attempting to remove the cleanup hook will
+ * have no effect. */
+struct ACHHandle;
+struct NODE_EXTERN DeleteACHHandle { void operator()(ACHHandle*) const; };
+typedef std::unique_ptr<ACHHandle, DeleteACHHandle> AsyncCleanupHookHandle;
+
+NODE_EXTERN AsyncCleanupHookHandle AddEnvironmentCleanupHook(
+    v8::Isolate* isolate,
+    void (*fun)(void* arg, void (*cb)(void*), void* cbarg),
+    void* arg);
+
+NODE_EXTERN void RemoveEnvironmentCleanupHook(AsyncCleanupHookHandle holder);
 
 /* Returns the id of the current execution context. If the return value is
  * zero then no execution has been set. This will happen if the user handles
@@ -685,8 +902,15 @@ NODE_EXTERN async_context EmitAsyncInit(v8::Isolate* isolate,
                                         v8::Local<v8::String> name,
                                         async_id trigger_async_id = -1);
 
-/* Emit the destroy() callback. */
+/* Emit the destroy() callback. The overload taking an `Environment*` argument
+ * should be used when the Isolate’s current Context is not associated with
+ * a Node.js Environment, or when there is no current Context, for example
+ * when calling this function during garbage collection. In that case, the
+ * `Environment*` value should have been acquired previously, e.g. through
+ * `GetCurrentEnvironment()`. */
 NODE_EXTERN void EmitAsyncDestroy(v8::Isolate* isolate,
+                                  async_context asyncContext);
+NODE_EXTERN void EmitAsyncDestroy(Environment* env,
                                   async_context asyncContext);
 
 class InternalCallbackScope;
@@ -796,8 +1020,8 @@ class NODE_EXTERN AsyncResource {
   };
 
  private:
-  v8::Isolate* isolate_;
-  v8::Persistent<v8::Object> resource_;
+  Environment* env_;
+  v8::Global<v8::Object> resource_;
   async_context async_context_;
 };
 
